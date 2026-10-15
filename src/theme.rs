@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use ratatui::style::Color;
@@ -438,8 +439,8 @@ impl Theme {
         };
 
         if has_plugin_theme {
-            if let Some(custom) = herdr.and_then(herdr_theme_custom) {
-                theme.apply_custom(custom);
+            if let Some(herdr) = herdr {
+                theme.apply_herdr_custom(herdr, system_is_dark());
             }
         }
         if let Some(custom) = plugin_custom {
@@ -449,20 +450,41 @@ impl Theme {
     }
 
     fn from_herdr_config(v: &toml::Value) -> Self {
+        Self::from_herdr_config_with_mode(v, system_is_dark())
+    }
+
+    fn from_herdr_config_with_mode(v: &toml::Value, dark: bool) -> Self {
         let mut theme = Self::catppuccin();
-        if let Some(name) = v
-            .get("theme")
-            .and_then(|x| x.as_table())
-            .and_then(|x| x.get("name"))
-            .and_then(|x| x.as_str())
-            .and_then(Self::from_name)
-        {
-            theme = name;
+        let table = v.get("theme").and_then(|x| x.as_table());
+        let str_key = |key: &str| table.and_then(|t| t.get(key)).and_then(|x| x.as_str());
+        // With auto_switch, Herdr uses dark_name or light_name for the current mode.
+        let auto_switch = table
+            .and_then(|t| t.get("auto_switch"))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let mode_name = if dark { "dark_name" } else { "light_name" };
+        let name = auto_switch
+            .then(|| str_key(mode_name))
+            .flatten()
+            .or_else(|| str_key("name"));
+        if let Some(named) = name.and_then(Self::from_name) {
+            theme = named;
         }
-        if let Some(custom) = herdr_theme_custom(v) {
-            theme.apply_custom(custom);
-        }
+        theme.apply_herdr_custom(v, dark);
         theme
+    }
+
+    // Flat [theme.custom] tokens apply to all modes. Nested [theme.custom.dark]
+    // and [theme.custom.light] tables apply only to their mode.
+    fn apply_herdr_custom(&mut self, v: &toml::Value, dark: bool) {
+        let Some(custom) = herdr_theme_custom(v) else {
+            return;
+        };
+        self.apply_custom(custom);
+        let mode = if dark { "dark" } else { "light" };
+        if let Some(mode_custom) = custom.get(mode).and_then(|x| x.as_table()) {
+            self.apply_custom(mode_custom);
+        }
     }
 
     fn from_name(name: &str) -> Option<Self> {
@@ -533,6 +555,19 @@ fn herdr_theme_custom(v: &toml::Value) -> Option<&toml::map::Map<String, toml::V
         .and_then(|theme| theme.as_table())
         .and_then(|theme| theme.get("custom"))
         .and_then(|custom| custom.as_table())
+}
+
+// Herdr does not give the current mode to plugins. Read the macOS appearance
+// setting, and use dark mode on other platforms.
+fn system_is_dark() -> bool {
+    if !cfg!(target_os = "macos") {
+        return true;
+    }
+    Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "Dark")
+        .unwrap_or(true)
 }
 
 fn herdr_config_path() -> PathBuf {
@@ -606,6 +641,37 @@ mod tests {
 
         assert_eq!(theme.panel_bg, rgb(24, 24, 37));
         assert_eq!(theme.accent, rgb(137, 180, 250));
+    }
+
+    #[test]
+    fn auto_switch_uses_mode_name_and_mode_custom_tokens() {
+        let config = theme_value(
+            r##"
+            [theme]
+            name = "tokyo-night"
+            auto_switch = true
+            light_name = "rose_pine_dawn"
+            dark_name = "tokyo-night"
+
+            [theme.custom]
+            red = "#111111"
+
+            [theme.custom.light]
+            accent = "#4876d6"
+
+            [theme.custom.dark]
+            accent = "#82aaff"
+            "##,
+        );
+
+        let dark = Theme::from_herdr_config_with_mode(&config, true);
+        assert_eq!(dark.accent, rgb(0x82, 0xaa, 0xff));
+        assert_eq!(dark.red, rgb(0x11, 0x11, 0x11));
+
+        let light = Theme::from_herdr_config_with_mode(&config, false);
+        assert_eq!(light.accent, rgb(0x48, 0x76, 0xd6));
+        assert_eq!(light.text, rgb(70, 66, 97));
+        assert_eq!(light.red, rgb(0x11, 0x11, 0x11));
     }
 
     #[test]
